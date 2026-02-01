@@ -1,0 +1,28 @@
+{
+  "text_elements": [
+    {
+      "original": "HELLO",
+      "translation": "ПРИВЕТ",
+      "x": 0.25,
+      "y": 0.05,
+      "width": 0.5,
+      "height": 0.1
+    },
+    {
+      "original": "IS IT MEME YOU’RE LOOKING FOR?",
+      "translation": "ЭТО МЕМ, КОТОРЫЙ ВЫ ИЩЕТЕ?",
+      "x": 0.1,
+      "y": 0.8,
+      "width": 0.8,
+      "height": 0.1
+    },
+    {
+      "original": "SO MUCH PUN .COM",
+      "translation": "ТАК МНОГО КАЛАМБУРОВ .КОМ",
+      "x": 0.05,
+      "y": 0.95,
+      "width": 0.4,
+      "height": 0.03
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+[
+  {
+    "original": "HELLO",
+    "translation": "ПРИВЕТ",
+    "bbox": [
+      160,
+      30,
+      160,
+      40
+    ]
+  },
+  {
+    "original": "IS IT MEME YOU'RE LOOKING FOR?",
+    "translation": "ЭТО МЕМ, КОТОРЫЙ ВЫ ИЩЕТЕ?",
+    "bbox": [
+      40,
+      340,
+      400,
+      70
+    ]
+  },
+  {
+    "original": "SO MUCH PUN .COM",
+    "translation": "СO МНOГО ПОЛУШАРИЙ",
+    "bbox": [
+      10,
+      460,
+      150,
+      20
+    ]
+  }
+]

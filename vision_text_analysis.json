@@ -1,0 +1,16 @@
+```json
+[
+    {
+        "original_text": "HELLO",
+        "russian_translation": "ПРИВЕТ"
+    },
+    {
+        "original_text": "IS IT MEME YOU'RE LOOKING FOR?",
+        "russian_translation": "ЭТО ТОТ МЕМ, КОТОРЫЙ ВЫ ИЩЕТЕ?"
+    },
+    {
+        "original_text": "SO MUCH PUN .COM",
+        "russian_translation": "SO MUCH PUN .COM"
+    }
+]
+```

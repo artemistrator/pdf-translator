@@ -1,0 +1,29 @@
+{
+  "name": "document-translator-web",
+  "version": "0.1.0",
+  "private": true,
+  "//": "NOTE: react-window v1.8.10 is used because newer versions (2.x) have different exports. React types pinned for compatibility.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "next": "14.0.4",
+    "react": "^18",
+    "react-dom": "^18",
+    "react-markdown": "^10.1.0",
+    "react-window": "1.8.10"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "^18",
+    "@types/react-dom": "^18",
+    "eslint": "^8",
+    "eslint-config-next": "14.0.4",
+    "prettier": "^3.1.1",
+    "typescript": "^5"
+  }
+}

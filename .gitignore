@@ -1,0 +1,126 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.manifest
+*.spec
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.pytest_cache/
+.hypothesis/
+
+# Virtual environments
+env/
+venv/
+ENV/
+env.bak
+venv.bak
+.venv
+.ENV
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Local configuration
+.env
+.env.local
+.env.dev
+.env.test
+.env.production
+*.local
+*.bak
+
+# Node.js (for the web app)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.next/
+out/
+.nuxt/
+dist/
+build/
+
+# Data and temporary files
+data/
+tmp/
+temp/
+logs/
+*.tmp
+*.temp
+
+# PDF translator specific
+apps/api/data/
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.webp
+*.svg
+
+# Test files
+test_*.html
+debug_*.html
+downloaded_test.html
+test_render.html
+test_ocr_html.html
+test_final_ocr.html
+test_download.html
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Compiled files
+*.exe
+*.dll
+*.dylib
+*.class
+
+# Coverage reports
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/

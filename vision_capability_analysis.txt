@@ -1,0 +1,15 @@
+I'm unable to directly modify images or generate new images. However, I can guide you on how to do it using image editing tools like Photoshop, GIMP, or online editors such as Pixlr:
+
+1. **Open the Image**: Use an image editing tool to open the original image.
+
+2. **Select Text Tool**: Use the text tool to overlay new text.
+
+3. **Replace Text**: Translate the English text to Russian. For example:
+   - "HELLO" -> "ПРИВЕТ"
+   - "IS IT MEME YOU'RE LOOKING FOR?" -> "ЭТО МЕМ, КОТОРЫЙ ТЫ ИЩЕШЬ?"
+
+4. **Adjust Font and Size**: Make sure the font and size match the original style as closely as possible.
+
+5. **Save**: Save the modified image.
+
+If you need more guidance on specific steps in any software, feel free to ask!

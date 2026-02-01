@@ -1,0 +1,1499 @@
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import os
+import logging
+import json
+from dotenv import load_dotenv
+from storage import storage_manager, PROJECT_ROOT, resolve_storage_dir
+import uuid
+from datetime import datetime
+from pathlib import Path
+# Import processing modules
+from pdf_render import render_pdf_to_pngs
+from openai_vision import analyze_document_images
+from html_render import vision_to_html, generate_pdf_from_markdown
+from pdf_generate import html_to_pdf_bytes_async
+from pdf_overlay_generate import generate_overlay_pdf
+from debug_render import render_all_debug_pages
+from pdf_to_markdown import pdf_to_markdown_with_assets
+from ocr_service import perform_ocr_on_image
+
+# Load environment variables with priority: apps/api/.env → .env
+from pathlib import Path
+api_env_path = Path(__file__).parent / ".env"
+root_env_path = Path(__file__).parents[2] / ".env"
+
+# Load API-specific .env first (higher priority)
+if api_env_path.exists():
+    load_dotenv(dotenv_path=api_env_path, override=True)
+
+# Load root .env as fallback
+if root_env_path.exists():
+    load_dotenv(dotenv_path=root_env_path, override=False)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="Document Translator API",
+    description="Vision-LLM Document Translation Service",
+    version="0.1.0"
+)
+
+# Log startup information
+logger.info(f"Working directory: {Path.cwd()}")
+storage_dir = resolve_storage_dir()
+logger.info(f"Storage directory: {storage_dir}")
+
+# Configure CORS for web frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # Next.js dev server
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "document-translator-api",
+        "version": "0.1.0"
+    }
+
+@app.post("/api/translate")
+async def create_translation_job(
+    file: UploadFile = File(...),
+    target_language: str = Form(...)
+):
+    """
+    Create a new translation job
+    
+    Args:
+        file: PDF file to translate
+        target_language: Target language code (e.g., 'en', 'es', 'de')
+        
+    Returns:
+        JSON with job_id
+    """
+    # Validate file type
+    if file.content_type != "application/pdf":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only PDF files are allowed"
+        )
+    
+    # Validate file extension
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File must have .pdf extension"
+        )
+    
+    # Validate file size (20MB limit)
+    content = await file.read()
+    file_size = len(content)
+    if file_size > 20 * 1024 * 1024:  # 20MB
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="File size exceeds 20MB limit"
+        )
+    
+    # Reset file pointer
+    await file.seek(0)
+    
+    # Generate job ID
+    job_id = str(uuid.uuid4())
+    
+    # Save file
+    input_path = storage_manager.save_uploadfile(job_id, file, "input.pdf")
+    
+    # Create job data
+    job_data = {
+        "job_id": job_id,
+        "status": "queued",
+        "target_language": target_language,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "input_path": str(input_path),
+        "output_path": None,
+        "error": None
+    }
+    
+    # Save job metadata
+    storage_manager.save_job(job_id, job_data)
+    
+    # Log operation details
+    logger.info(f"Created job: {job_id}")
+    logger.info(f"Input file saved to: {input_path}")
+    logger.info(f"Job metadata saved to: {storage_manager.jobs_dir / job_id / 'job.json'}")
+    
+    return {"job_id": job_id}
+
+
+@app.get("/api/status/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Get job status
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        JSON with job status
+    """
+    try:
+        job_data = storage_manager.load_job(job_id)
+        return {
+            "job_id": job_id,
+            "status": job_data["status"],
+            "message": job_data.get("error", "")
+        }
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+
+
+@app.post("/api/process/{job_id}")
+async def process_job(
+    job_id: str,
+    force: bool = Query(False, description="Force reprocessing even if vision.json exists")
+):
+    """
+    Process a translation job: PDF → PNG → Vision Analysis → vision.json
+    
+    Args:
+        job_id: Job identifier
+        force: Force reprocessing even if vision.json exists (default: False)
+        
+    Returns:
+        JSON with processing result or error
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Load job data
+    job_data = storage_manager.load_job(job_id)
+    
+    # Idempotency check - if already done and not forced, return early
+    job_dir = storage_manager.jobs_dir / job_id
+    vision_json_path = job_dir / "vision.json"
+    
+    if not force and job_data.get("status") == "done" and vision_json_path.exists():
+        logger.info(f"Job {job_id} already completed, returning cached result")
+        return {
+            "job_id": job_id,
+            "status": "done",
+            "message": "Using cached result"
+        }
+    
+    # Record processing start time
+    processing_started_at = datetime.utcnow().isoformat() + "Z"
+    
+    # Update status to processing
+    job_data["status"] = "processing"
+    job_data["error"] = None
+    job_data["processing_started_at"] = processing_started_at
+    storage_manager.save_job(job_id, job_data)
+    
+    try:
+        # Get input PDF path
+        input_path_str = job_data.get("input_path")
+        if not input_path_str:
+            raise ValueError("input_path not found in job data")
+        
+        input_pdf_path = Path(input_path_str)
+        if not input_pdf_path.exists():
+            raise FileNotFoundError(f"Input PDF not found: {input_pdf_path}")
+        
+        # Get configuration from environment
+        max_pages = int(os.getenv("VISION_MAX_PAGES", "2"))
+        dpi = int(os.getenv("VISION_DPI", "144"))
+        model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        target_language = job_data.get("target_language", "en")
+        use_structured_outputs = os.getenv("USE_STRUCTURED_OUTPUTS", "true").lower() == "true"
+        
+        # Create pages directory
+        pages_dir = job_dir / "pages"
+        
+        # Render PDF to PNGs
+        png_paths = render_pdf_to_pngs(
+            input_pdf_path=input_pdf_path,
+            out_dir=pages_dir,
+            max_pages=max_pages,
+            dpi=dpi
+        )
+        
+        if not png_paths:
+            raise ValueError("No pages were rendered")
+        
+        # Record number of pages rendered
+        vision_pages_rendered = len(png_paths)
+        
+        # Attempt OpenAI analysis
+        try:
+            vision_result = analyze_document_images(
+                image_paths=png_paths,
+                target_language=target_language,
+                model=None,  # Let module get from env
+                use_structured_outputs=None,  # Let module get from env
+                job_dir=job_dir  # Pass job_dir for debug artifacts
+            )
+            
+            # Record processing finish time
+            processing_finished_at = datetime.utcnow().isoformat() + "Z"
+            
+            # Add metadata
+            vision_result["meta"] = {
+                "job_id": job_id,
+                "target_language": target_language,
+                "processed_at": processing_finished_at,
+                "model": model,
+                "vision_pages_rendered": vision_pages_rendered
+            }
+            
+            # Save vision.json
+            with open(vision_json_path, "w", encoding="utf-8") as f:
+                json.dump(vision_result, f, indent=2, ensure_ascii=False)
+            
+            # Update job with completion data
+            storage_manager.save_job(job_id, {
+                **job_data,
+                "status": "done",
+                "output_path": str(vision_json_path),
+                "error": None,
+                "processing_finished_at": processing_finished_at,
+                "vision_pages_rendered": vision_pages_rendered,
+                "openai_model_used": model
+            })
+            
+            logger.info(f"Job {job_id} completed successfully")
+            return {
+                "job_id": job_id,
+                "status": "done"
+            }
+            
+        except RuntimeError as e:
+            # Handle missing API key
+            if "OPENAI_API_KEY is not set" in str(e):
+                error_msg = "OPENAI_API_KEY is not set"
+                storage_manager.save_job(job_id, {
+                    **job_data,
+                    "status": "error",
+                    "error": error_msg,
+                    "processing_finished_at": datetime.utcnow().isoformat() + "Z"
+                })
+                # Return error response directly
+                return {
+                    "job_id": job_id,
+                    "status": "error",
+                    "error": error_msg
+                }
+            else:
+                raise
+                
+    except Exception as e:
+        # Handle all other errors
+        error_msg = str(e)
+        processing_finished_at = datetime.utcnow().isoformat() + "Z"
+        
+        storage_manager.save_job(job_id, {
+            **job_data,
+            "status": "error",
+            "error": error_msg,
+            "processing_finished_at": processing_finished_at
+        })
+        
+        logger.error(f"Job {job_id} failed: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.post("/api/generate/{job_id}")
+async def generate_pdf(
+    job_id: str, 
+    mode: str = Query("html", description="Generation mode: 'html' or 'overlay'"),
+    debug_overlay: bool = Query(False, description="Enable debug mode for overlay (red outlines)"),
+    overlay_scope: str = Query("headings", description="Overlay replacement scope: 'headings', 'safe', or 'all'")
+):
+    """
+    Generate PDF from vision analysis result.
+    
+    Prerequisites:
+    - job.status == "done"
+    - vision.json exists
+    
+    Query Parameters:
+    - mode: "html" (default) or "overlay"
+    - overlay_scope: "headings" (default), "safe", or "all"
+    
+    Process:
+    - Reads vision.json or edited.json
+    - If mode=="html": generates HTML → PDF using Playwright
+    - If mode=="overlay": generates overlay PDF using PyMuPDF
+    - Saves to jobs/{job_id}/output.pdf or output_overlay.pdf
+    - Updates job.json with output_path
+    
+    Returns:
+        JSON with job status and output type
+    """
+    # Validate overlay_scope parameter
+    valid_scopes = {"headings", "safe", "all"}
+    if overlay_scope not in valid_scopes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid overlay_scope. Must be one of: {', '.join(valid_scopes)}"
+        )
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Load job data
+    job_data = storage_manager.load_job(job_id)
+    
+    # Check prerequisites
+    if job_data.get("status") != "done":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job must be in 'done' status. Run /api/process first."
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    
+    # Validate mode parameter
+    if mode not in ["html", "overlay"]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid mode. Must be 'html' or 'overlay'"
+        )
+    
+    # Priority: edited.json > vision.json
+    edited_json_path = job_dir / "edited.json"
+    vision_json_path = job_dir / "vision.json"
+    
+    source_file = edited_json_path if edited_json_path.exists() else vision_json_path
+    
+    if not source_file.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vision data not found. Run /api/process first."
+        )
+    
+    # Read vision/edited data
+    try:
+        with open(source_file, "r", encoding="utf-8") as f:
+            vision_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read vision data: {e}"
+        )
+    
+    # Generate document title
+    title = job_data.get("filename", f"Document {job_id}")
+    
+    try:
+        if mode == "html":
+            # Check if page images exist before rendering
+            pages_dir = job_dir / "pages"
+            first_page_image = pages_dir / "page_1.png"
+            if not first_page_image.exists():
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Run /api/process first (missing rendered page images)"
+                )
+            
+            # Generate HTML with embedded page images (always embed)
+            html_content = vision_to_html(vision_data, title, job_dir=job_dir, embed_page_images=True)
+            render_html_path = job_dir / "render.html"
+            
+            with open(render_html_path, "w", encoding="utf-8") as f:
+                f.write(html_content)
+            
+            # Verify embedded images are present
+            if "data:image/png;base64," not in html_content:
+                # Save the problematic HTML for debugging
+                with open(render_html_path, "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="HTML render missing embedded images; check pages/page_*.png exists"
+                )
+            
+            # Log first img tag snippet for verification
+            import re
+            img_match = re.search(r'<img[^>]+src="data:image/png;base64,[^"]+"', html_content)
+            if img_match:
+                logger.info(f"Embedded image found: {img_match.group()[:300]}...")
+            else:
+                logger.warning("No embedded image tag found in HTML")
+            
+            # Generate PDF using Playwright
+            pdf_bytes = await html_to_pdf_bytes_async(html_content)
+            output_pdf_path = job_dir / "output.pdf"
+            
+            with open(output_pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            
+            # Update job data
+            storage_manager.save_job(job_id, {
+                **job_data,
+                "render_html_path": str(render_html_path),
+                "output_path": str(output_pdf_path)
+            })
+            
+            logger.info(f"HTML PDF generated for job {job_id}")
+            
+        else:  # mode == "overlay"
+            # Generate overlay PDF using PyMuPDF
+            # Get DPI from job metadata or use default
+            dpi = job_data.get("dpi", 144)
+            
+            pdf_bytes = generate_overlay_pdf(
+                job_dir, 
+                vision_data, 
+                dpi, 
+                debug=debug_overlay,
+                overlay_scope=overlay_scope
+            )
+            output_filename = "output_overlay_debug.pdf" if debug_overlay else "output_overlay.pdf"
+            output_pdf_path = job_dir / output_filename
+            
+            with open(output_pdf_path, "wb") as f:
+                f.write(pdf_bytes)
+            
+            # Update job data (keep render_html_path if it exists from previous HTML generation)
+            updated_job_data = {
+                **job_data,
+                "output_path": str(output_pdf_path)
+            }
+            
+            # Preserve render_html_path if it exists
+            if "render_html_path" in job_data:
+                updated_job_data["render_html_path"] = job_data["render_html_path"]
+                
+            storage_manager.save_job(job_id, updated_job_data)
+            
+            logger.info(f"Overlay PDF generated for job {job_id}")
+        
+        return {
+            "job_id": job_id,
+            "status": "done",
+            "output": "pdf",
+            "mode": mode
+        }
+        
+    except RuntimeError as e:
+        if "chromium" in str(e).lower() or "playwright" in str(e).lower():
+            error_msg = f"{str(e)}. Run: make api-playwright-install"
+        else:
+            error_msg = str(e)
+            
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"PDF generation failed for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.get("/api/page-image/{job_id}/{page_num}")
+async def get_page_image(job_id: str, page_num: int):
+    """
+    Serve page image as static file response.
+    
+    Args:
+        job_id: Job identifier
+        page_num: Page number (1-indexed)
+        
+    Returns:
+        PNG image file response
+    """
+    # Validate page number
+    if page_num < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Page number must be positive"
+        )
+    
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Build image path
+    job_dir = storage_manager.jobs_dir / job_id
+    pages_dir = job_dir / "pages"
+    image_path = pages_dir / f"page_{page_num}.png"
+    
+    # Check if file exists
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Page image {page_num} not found for job {job_id}"
+        )
+    
+    # Return file response
+    return FileResponse(
+        image_path,
+        media_type="image/png",
+        filename=f"page_{page_num}.png"
+    )
+
+
+@app.get("/api/debug-page-image/{job_id}/{page_num}")
+async def get_debug_page_image(job_id: str, page_num: int):
+    """
+    Serve debug page image with bounding boxes.
+    
+    Args:
+        job_id: Job identifier
+        page_num: Page number (1-indexed)
+        
+    Returns:
+        PNG image file response
+    """
+    # Validate page number
+    if page_num < 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Page number must be positive"
+        )
+    
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Build debug image path
+    job_dir = storage_manager.jobs_dir / job_id
+    pages_dir = job_dir / "pages"
+    debug_image_path = pages_dir / f"debug_page_{page_num}.png"
+    
+    # Check if debug file exists
+    if not debug_image_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Debug page image {page_num} not found for job {job_id}"
+        )
+    
+    # Return file response
+    return FileResponse(
+        debug_image_path,
+        media_type="image/png",
+        filename=f"debug_page_{page_num}.png"
+    )
+
+
+@app.get("/api/render-html/{job_id}")
+async def get_render_html(job_id: str):
+    """
+    Get rendered HTML for a job - returns render.html content
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        HTML content of render.html
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    render_html_path = job_dir / "render.html"
+    
+    if not render_html_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rendered HTML not found. Run /api/generate with mode=html first."
+        )
+    
+    try:
+        with open(render_html_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        
+        # Return as HTML response
+        from fastapi.responses import Response
+        return Response(
+            content=html_content,
+            media_type="text/html",
+            headers={"Content-Disposition": "inline"}
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read render.html: {e}"
+        )
+
+
+@app.get("/api/pdf-markdown/{job_id}")
+async def get_pdf_markdown(job_id: str):
+    """
+    Get Markdown content for a job that was converted from PDF.
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        JSON with job_id and full markdown text
+        
+    Raises:
+        404: If job doesn't exist
+        409: If layout.md doesn't exist (run POST /api/pdf-markdown/{job_id} first)
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Check if layout.md exists
+    job_dir = storage_manager.jobs_dir / job_id
+    layout_md_path = job_dir / "layout.md"
+    
+    if not layout_md_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Run POST /api/pdf-markdown/{job_id} first"
+        )
+    
+    try:
+        # Read Markdown content
+        with open(layout_md_path, "r", encoding="utf-8") as f:
+            markdown_content = f.read()
+        
+        return {
+            "job_id": job_id,
+            "markdown": markdown_content
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Failed to read Markdown for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.get("/api/md-asset/{job_id}/{asset:path}")
+async def get_markdown_asset(job_id: str, asset: str):
+    """
+    Serve extracted markdown assets (images) with path traversal protection.
+    
+    Args:
+        job_id: Job identifier
+        asset: Asset path (e.g., page1_img1.png, subfolder/image.png)
+        
+    Returns:
+        Image file response
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Build asset path
+    job_dir = storage_manager.jobs_dir / job_id
+    assets_dir = job_dir / "md_assets"
+    asset_path = assets_dir / asset
+    
+    # Security: Prevent path traversal attacks
+    # Ensure the resolved path is within the md_assets directory
+    try:
+        asset_path = asset_path.resolve()
+        assets_dir = assets_dir.resolve()
+        if not str(asset_path).startswith(str(assets_dir)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Path traversal detected"
+            )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid asset path"
+        )
+    
+    # Check if file exists
+    if not asset_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Asset {asset} not found for job {job_id}"
+        )
+    
+    # Determine media type based on file extension
+    media_type = "image/png"  # default
+    if asset_path.suffix.lower() in [".jpg", ".jpeg"]:
+        media_type = "image/jpeg"
+    elif asset_path.suffix.lower() == ".gif":
+        media_type = "image/gif"
+    elif asset_path.suffix.lower() == ".webp":
+        media_type = "image/webp"
+    
+    # Return file response
+    return FileResponse(
+        asset_path,
+        media_type=media_type,
+        filename=asset_path.name
+    )
+
+
+@app.get("/api/debug/paths")
+async def debug_paths():
+    """Debug endpoint to show path information"""
+    cwd = Path.cwd()
+    storage_dir = resolve_storage_dir()
+    
+    return {
+        "cwd": str(cwd),
+        "project_root": str(PROJECT_ROOT),
+        "storage_dir": str(storage_dir),
+        "storage_dir_exists": storage_dir.exists()
+    }
+
+
+@app.get("/api/result/{job_id}")
+async def get_job_result(job_id: str, mode: str = None):
+    """
+    Get job result - returns vision.json content or PDF file for completed jobs
+    
+    Args:
+        job_id: Job identifier
+        mode: Optional mode ('pdf-from-markdown' for markdown-generated PDF)
+        
+    Returns:
+        JSON content of vision.json or PDF file
+    """
+    try:
+        job_data = storage_manager.load_job(job_id)
+        
+        if job_data["status"] != "done":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Job is not completed yet. Current status: {job_data['status']}"
+            )
+        
+        # Handle different modes
+        if mode == "pdf-from-markdown":
+            # Return PDF generated from markdown
+            pdf_from_markdown_path = job_data.get("pdf_from_markdown_path")
+            if not pdf_from_markdown_path:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="PDF from markdown not found for this job"
+                )
+            output_file = storage_manager.base_dir / pdf_from_markdown_path
+            filename = "result_from_markdown.pdf"
+        else:
+            # Default behavior - return main output
+            output_path = job_data.get("output_path")
+            if not output_path:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Job marked as done but no output path specified"
+                )
+            output_file = Path(output_path)
+            filename = "translated.pdf"
+        
+        if not output_file.exists():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Output file not found"
+            )
+        
+        # Check file extension to determine response type
+        if output_file.suffix.lower() == ".pdf":
+            # Return PDF file
+            return FileResponse(
+                output_file,
+                media_type="application/pdf",
+                filename=filename,
+                headers={
+                    "Content-Disposition": f"inline; filename=\"{filename}\""
+                }
+            )
+        else:
+            # Return vision.json content (backward compatibility)
+            with open(output_file, "r", encoding="utf-8") as f:
+                vision_data = json.load(f)
+            return vision_data
+            
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+
+
+@app.get("/api/vision/{job_id}")
+async def get_vision_data(job_id: str):
+    """
+    Get vision data for a job - returns edited.json if exists, otherwise vision.json
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        JSON content of vision/edited data or error
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    
+    # Priority: edited.json > vision.json
+    edited_json_path = job_dir / "edited.json"
+    vision_json_path = job_dir / "vision.json"
+    
+    target_file = edited_json_path if edited_json_path.exists() else vision_json_path
+    
+    if not target_file.exists():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Vision data not found. Run /api/process first."
+        )
+    
+    try:
+        with open(target_file, "r", encoding="utf-8") as f:
+            vision_data = json.load(f)
+        return vision_data
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read vision data: {e}"
+        )
+
+
+@app.put("/api/vision/{job_id}")
+async def save_vision_edits(job_id: str, vision_data: dict):
+    """
+    Save edited vision data
+    
+    Args:
+        job_id: Job identifier
+        vision_data: Edited vision data (same format as vision.json)
+        
+    Returns:
+        Confirmation of save
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Basic validation
+    if "pages" not in vision_data or "meta" not in vision_data:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid vision data format: missing 'pages' or 'meta'"
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    edited_json_path = job_dir / "edited.json"
+    
+    try:
+        # Atomic write like job.json
+        temp_path = edited_json_path.with_suffix(".tmp")
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(vision_data, f, indent=2, ensure_ascii=False)
+        temp_path.replace(edited_json_path)
+        
+        # Update job.json
+        job_data = storage_manager.load_job(job_id)
+        storage_manager.save_job(job_id, {
+            **job_data,
+            "edited_path": str(edited_json_path),
+            "has_manual_edits": True
+        })
+        
+        logger.info(f"Saved edits for job {job_id} to {edited_json_path}")
+        return {
+            "job_id": job_id,
+            "saved": True
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to save edits for job {job_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save edits: {e}"
+        )
+
+
+@app.post("/api/pdf-markdown/{job_id}")
+async def convert_pdf_to_markdown(job_id: str):
+    """
+    Convert PDF to Markdown using PyMuPDF4LLM.
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        JSON with conversion result
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Load job data
+    job_data = storage_manager.load_job(job_id)
+    
+    # Get input PDF path
+    input_path_str = job_data.get("input_path")
+    if not input_path_str:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="input_path not found in job data"
+        )
+    
+    input_pdf_path = Path(input_path_str)
+    if not input_pdf_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Input PDF not found: {input_pdf_path}"
+        )
+    
+    # Validate it's a PDF file
+    if not input_pdf_path.suffix.lower() == ".pdf":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Input file is not a PDF"
+        )
+    
+    try:
+        # Get job directory
+        job_dir = storage_manager.jobs_dir / job_id
+        
+        # Convert PDF to Markdown
+        result = pdf_to_markdown_with_assets(input_pdf_path, job_dir)
+        
+        # Update job data with markdown info
+        updated_job_data = {
+            **job_data,
+            "markdown_path": result["markdown_path"],
+            "markdown_assets_dir": result["assets_dir"],
+            "has_markdown": True,
+            "markdown_chars": result["chars"],
+            "markdown_images_count": result["images_count"]
+        }
+        storage_manager.save_job(job_id, updated_job_data)
+        
+        logger.info(f"PDF to Markdown conversion completed for job {job_id}")
+        
+        return {
+            "job_id": job_id,
+            "markdown_path": result["markdown_path"],
+            "images_count": result["images_count"],
+            "chars": result["chars"]
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"PDF to Markdown conversion failed for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.post("/api/debug-render/{job_id}")
+async def debug_render(job_id: str):
+    """
+    Generate debug page images with bounding boxes for all pages.
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        JSON with job_id and number of debug pages generated
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Load job data
+    job_data = storage_manager.load_job(job_id)
+    
+    # Check prerequisites
+    if job_data.get("status") != "done":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job must be in 'done' status. Run /api/process first."
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    
+    # Priority: edited.json > vision.json
+    edited_json_path = job_dir / "edited.json"
+    vision_json_path = job_dir / "vision.json"
+    
+    source_file = edited_json_path if edited_json_path.exists() else vision_json_path
+    
+    if not source_file.exists():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Vision data not found. Run /api/process first."
+        )
+    
+    # Read vision/edited data
+    try:
+        with open(source_file, "r", encoding="utf-8") as f:
+            vision_data = json.load(f)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to read vision data: {e}"
+        )
+    
+    try:
+        # Generate debug images for all pages
+        debug_count = render_all_debug_pages(job_dir, vision_data)
+        
+        logger.info(f"Generated {debug_count} debug page images for job {job_id}")
+        
+        return {
+            "job_id": job_id,
+            "debug_pages": debug_count
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Debug render failed for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.post("/api/pdf-from-markdown/{job_id}")
+async def pdf_from_markdown(job_id: str, payload: dict):
+    """
+    Generate PDF from Markdown content.
+    
+    Args:
+        job_id: Job identifier
+        payload: { "markdown": "full markdown text" }
+        
+    Returns:
+        JSON with status and pdf_path
+    """
+    # Validate input
+    markdown_content = payload.get("markdown")
+    if not markdown_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing 'markdown' field in request body"
+        )
+    
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    job_dir = storage_manager.jobs_dir / job_id
+    
+    # 1) Save markdown to jobs/{job_id}/markdown_for_pdf.md
+    markdown_path = job_dir / "markdown_for_pdf.md"
+    markdown_path.write_text(markdown_content, encoding='utf-8')
+    
+    # 2) Define output PDF path
+    output_pdf = job_dir / "result.pdf"
+    
+        # Generate PDF from markdown with OCR support
+        try:
+            # Save markdown to temporary file
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False, encoding='utf-8') as f:
+                f.write(markdown_content)
+                temp_md_path = Path(f.name)
+            
+            # Generate PDF
+            pdf_filename = f"output_with_ocr_{job_id}.pdf"
+            pdf_path = job_dir / pdf_filename
+            
+            try:
+                from html_render import generate_pdf_from_markdown
+                await generate_pdf_from_markdown(temp_md_path, pdf_path)
+                # Clean up temporary file
+                temp_md_path.unlink()
+                
+                # Update job status
+                job_data = storage_manager.load_job(job_id)
+                job_data["pdf_from_markdown_status"] = "completed"
+                job_data["pdf_from_markdown_path"] = str(pdf_path.relative_to(storage_manager.base_dir))
+                storage_manager.save_job(job_id, job_data)
+                
+                return {
+                    "status": "completed",
+                    "pdf_path": str(pdf_path.relative_to(storage_manager.base_dir)),
+                    "message": "PDF generated successfully with OCR overlays"
+                }
+            except Exception as pdf_error:
+                # Clean up temporary file
+                temp_md_path.unlink()
+                
+                # Handle macOS-specific issues
+                import platform
+                if platform.system() == "Darwin":  # macOS
+                    logger.warning(f"PDF generation failed on macOS: {pdf_error}")
+                    # Generate HTML file as fallback
+                    from html_render import markdown2
+                    html_content = markdown2.markdown(markdown_content)
+                    
+                    # Add OCR overlays manually
+                    import re
+                    import os
+                    api_base = os.getenv("API_BASE_URL", "http://localhost:8000")
+                    prefix = f'{api_base}/api/md-asset/{job_id}/'
+                    
+                    # Replace asset paths
+                    html_content = html_content.replace('src="md_assets/', f'src="{prefix}')
+                    html_content = html_content.replace("src='md_assets/", f"src='{prefix}")
+                    
+                    # Add OCR overlays
+                    ocr_translations = {}
+                    try:
+                        ocr_translations = storage_manager.load_ocr_translations(job_id)
+                    except FileNotFoundError:
+                        pass
+                    
+                    if ocr_translations:
+                        # Wrap images with OCR containers and overlays
+                        img_pattern = r'<img[^>]+src=["\']([^"\']+/md_assets/([^"\']+\.[^"\']+))["\'][^>]*/?>'
+                        matches = list(re.finditer(img_pattern, html_content))
+                        
+                        for match in reversed(matches):
+                            full_src = match.group(1)
+                            image_name = match.group(2)
+                            start_pos = match.start()
+                            end_pos = match.end()
+                            
+                            if image_name in ocr_translations:
+                                translations = ocr_translations[image_name]
+                                ocr_result = translations.get('ocr_result', {})
+                                text_translations = translations.get('translations', {})
+                                
+                                if ocr_result and 'ocr_boxes' in ocr_result:
+                                    container_start = f'<div class="ocr-container" style="position: relative; display: inline-block;">'
+                                    container_end = '</div>'
+                                    
+                                    overlay_divs = []
+                                    for i, box in enumerate(ocr_result['ocr_boxes']):
+                                        translated_text = text_translations.get(str(i), box['text'])
+                                        if len(box['bbox']) >= 4:
+                                            x1, y1, x2, y2 = box['bbox'][:4]
+                                            width = x2 - x1
+                                            height = y2 - y1
+                                            font_size = max(8, min(height * 0.8, 24))
+                                            
+                                            overlay_div = (
+                                                f'<div class="ocr-overlay" '
+                                                f'style="position: absolute; left: {x1}px; top: {y1}px; '
+                                                f'width: {width}px; height: {height}px; '
+                                                f'font-size: {font_size}px; line-height: 1; '
+                                                f'display: flex; align-items: center; color: black; '
+                                                f'font-family: Arial, sans-serif; font-weight: normal; '
+                                                f'white-space: nowrap; pointer-events: none;">'
+                                                f'{translated_text}'
+                                                f'</div>'
+                                            )
+                                            overlay_divs.append(overlay_div)
+                                    
+                                    img_tag = match.group(0)
+                                    replacement = (
+                                        container_start + 
+                                        img_tag + 
+                                        ''.join(overlay_divs) + 
+                                        container_end
+                                    )
+                                    
+                                    html_content = (
+                                        html_content[:start_pos] + 
+                                        replacement + 
+                                        html_content[end_pos:]
+                                    )
+                    
+                    # Create full HTML document
+                    full_html = f'''
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {{
+            font-family: Arial, sans-serif;
+            margin: 40mm;
+            line-height: 1.6;
+        }}
+        img {{
+            max-width: 100%;
+            height: auto;
+            display: block;
+        }}
+    </style>
+</head>
+<body>
+{html_content}
+</body>
+</html>
+'''
+                    
+                    html_filename = f"document_with_ocr_{job_id}.html"
+                    html_path = job_dir / html_filename
+                    html_path.write_text(full_html, encoding='utf-8')
+                    
+                    return {
+                        "status": "partial_success",
+                        "message": "HTML with OCR overlays generated. PDF generation failed due to macOS restrictions.",
+                        "download_link": f"/api/download-html/{job_id}?filename={html_filename}",
+                        "instructions": [
+                            "1. Click the download link to get the HTML file with OCR overlays",
+                            "2. Open the HTML file in Chrome/Safari/Firefox", 
+                            "3. Print to PDF (Ctrl+P or Cmd+P)",
+                            "4. Select 'Save as PDF' as destination",
+                            "5. The OCR text overlays will be preserved in the PDF"
+                        ]
+                    }
+                else:
+                    logger.error(f"PDF generation failed: {pdf_error}")
+                    raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {pdf_error}")
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"PDF generation from markdown failed for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.post("/api/ocr/{job_id}/{image_name}")
+async def ocr_image(job_id: str, image_name: str):
+    """
+    Perform OCR on an image from md_assets and return text with bounding boxes.
+    
+    Args:
+        job_id: Job identifier
+        image_name: Image filename (e.g., page1_img1.png)
+        
+    Returns:
+        JSON with image_url and ocr_boxes
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    # Build image path
+    job_dir = storage_manager.jobs_dir / job_id
+    assets_dir = job_dir / "md_assets"
+    image_path = assets_dir / image_name
+    
+    # Security: Prevent path traversal
+    try:
+        image_path = image_path.resolve()
+        assets_dir = assets_dir.resolve()
+        if not str(image_path).startswith(str(assets_dir)):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Path traversal detected"
+            )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid image path"
+        )
+    
+    # Check if image exists
+    if not image_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Image {image_name} not found in job {job_id}"
+        )
+    
+    # Perform OCR
+    try:
+        ocr_boxes = perform_ocr_on_image(image_path)
+        
+        # Construct image URL
+        api_base = os.getenv("API_BASE_URL", "http://localhost:8000")
+        image_url = f"{api_base}/api/md-asset/{job_id}/{image_name}"
+        
+        return {
+            "image_url": image_url,
+            "ocr_boxes": ocr_boxes
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"OCR failed for {image_name} in job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.get("/api/ocr-translations/{job_id}")
+async def get_ocr_translations(job_id: str):
+    """
+    Get saved OCR translations for a job.
+    
+    Args:
+        job_id: Job identifier
+        
+    Returns:
+        OCR translations dictionary
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    translations = storage_manager.load_ocr_translations(job_id)
+    return {"translations": translations}
+
+
+@app.post("/api/ocr-translations/{job_id}")
+async def save_ocr_translations(job_id: str, payload: dict):
+    """
+    Save OCR translations for a job.
+    
+    Args:
+        job_id: Job identifier
+        payload: { "translations": {...} }
+        
+    Returns:
+        Success confirmation
+    """
+    # Check if job exists
+    if not storage_manager.job_exists(job_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job {job_id} not found"
+        )
+    
+    translations = payload.get("translations")
+    if translations is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing 'translations' field in request body"
+        )
+    
+    try:
+        storage_manager.save_ocr_translations(job_id, translations)
+        return {"status": "success", "message": "Translations saved"}
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Failed to save OCR translations for job {job_id}: {error_msg}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_msg
+        )
+
+
+@app.get("/api/download-html/{job_id}")
+async def download_html_with_ocr(job_id: str, filename: str = None):
+    """Download HTML file with OCR overlays for manual PDF generation."""
+    try:
+        job_path = storage.get_job_path(job_id)
+        if not job_path.exists():
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        # Get markdown content
+        try:
+            markdown_content = storage.get_markdown(job_id)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="Markdown not found")
+        
+        # Get OCR translations
+        ocr_translations = {}
+        try:
+            ocr_translations = storage.get_ocr_translations(job_id)
+        except FileNotFoundError:
+            pass
+        
+        # Generate HTML with OCR overlays
+        html_content = render_markdown_with_ocr_overlays(markdown_content, ocr_translations)
+        
+        # Save HTML file
+        if filename:
+            html_filename = filename
+        else:
+            html_filename = f"document_with_ocr_{job_id}.html"
+        
+        html_path = job_path / html_filename
+        html_path.write_text(html_content, encoding='utf-8')
+        
+        return FileResponse(
+            path=str(html_path),
+            filename=html_filename,
+            media_type='text/html'
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"HTML download failed for job {job_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Document Translator API",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
