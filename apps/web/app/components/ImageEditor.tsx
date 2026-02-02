@@ -116,33 +116,37 @@ export default function ImageEditor({
     if (!imageRef.current) return
     
     const imgRect = imageRef.current.getBoundingClientRect()
+    const imgNaturalWidth = imageRef.current.naturalWidth || 1
+    const imgNaturalHeight = imageRef.current.naturalHeight || 1
     
     if (isDragging && selectedBoxIndex !== null) {
       // Convert screen coordinates to natural image coordinates
-      const naturalX = (e.clientX - imgRect.left) * (imageRef.current.naturalWidth / imgRect.width)
-      const naturalY = (e.clientY - imgRect.top) * (imageRef.current.naturalHeight / imgRect.height)
+      const naturalX = (e.clientX - imgRect.left) * (imgNaturalWidth / imgRect.width)
+      const naturalY = (e.clientY - imgRect.top) * (imgNaturalHeight / imgRect.height)
       
       setBoxes(prev => {
         const newBoxes = [...prev]
         const box = newBoxes[selectedBoxIndex]
-        // Grid snapping (snap to 5px grid)
+        const newX = naturalX - dragOffset.x
+        const newY = naturalY - dragOffset.y
         newBoxes[selectedBoxIndex] = {
           ...box,
-          x: Math.max(0, Math.round((naturalX - dragOffset.x) / 5) * 5),
-          y: Math.max(0, Math.round((naturalY - dragOffset.y) / 5) * 5)
+          // No hard snapping – smoother movement like in design tools
+          x: Math.max(0, newX),
+          y: Math.max(0, newY)
         }
         return newBoxes
       })
     }
     
     if (isResizing && selectedBoxIndex !== null && resizeHandle) {
-      const box = boxes[selectedBoxIndex]
       // Convert screen coordinates to natural image coordinates
-      const mouseX = (e.clientX - imgRect.left) * (imageRef.current.naturalWidth / imgRect.width)
-      const mouseY = (e.clientY - imgRect.top) * (imageRef.current.naturalHeight / imgRect.height)
+      const mouseX = (e.clientX - imgRect.left) * (imgNaturalWidth / imgRect.width)
+      const mouseY = (e.clientY - imgRect.top) * (imgNaturalHeight / imgRect.height)
       
       setBoxes(prev => {
         const newBoxes = [...prev]
+        const box = newBoxes[selectedBoxIndex]
         let newWidth = box.w
         let newHeight = box.h
         let newX = box.x
@@ -172,13 +176,12 @@ export default function ImageEditor({
             break
         }
         
-        // Grid snapping
         newBoxes[selectedBoxIndex] = {
           ...box,
-          x: Math.max(0, Math.round(newX / 5) * 5),
-          y: Math.max(0, Math.round(newY / 5) * 5),
-          w: Math.max(20, Math.round(newWidth / 5) * 5),
-          h: Math.max(20, Math.round(newHeight / 5) * 5)
+          x: Math.max(0, newX),
+          y: Math.max(0, newY),
+          w: Math.max(20, newWidth),
+          h: Math.max(20, newHeight)
         }
         return newBoxes
       })
@@ -257,6 +260,8 @@ export default function ImageEditor({
     }
   }, [isDragging, isResizing, selectedBoxIndex, dragOffset, resizeHandle])
 
+  const selectedBox = selectedBoxIndex !== null ? boxes[selectedBoxIndex] : null
+
   return (
     <div className="image-editor">
       {/* Toolbar */}
@@ -318,6 +323,46 @@ export default function ImageEditor({
         </div>
       </div>
 
+      {/* Properties panel for selected block */}
+      {selectedBox && (
+        <div className="editor-properties">
+          <div className="properties-row">
+            <div className="properties-group">
+              <label className="properties-label">Text</label>
+              <textarea
+                value={selectedBox.text}
+                onChange={(e) => handleTextChange(selectedBoxIndex!, e.target.value)}
+                className="properties-textarea"
+              />
+            </div>
+            <div className="properties-group">
+              <label className="properties-label">
+                Font size ({selectedBox.fontSize || Math.max(8, Math.min(selectedBox.h * 0.8, 24))} px)
+              </label>
+              <input
+                type="range"
+                min={8}
+                max={72}
+                step={1}
+                value={selectedBox.fontSize || Math.max(8, Math.min(selectedBox.h * 0.8, 24))}
+                onChange={(e) => {
+                  const size = parseInt(e.target.value, 10) || 12
+                  setBoxes(prev => {
+                    const next = [...prev]
+                    next[selectedBoxIndex!] = {
+                      ...next[selectedBoxIndex!],
+                      fontSize: size
+                    }
+                    return next
+                  })
+                }}
+                className="properties-slider"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Editor Canvas */}
       <div 
         ref={containerRef}
@@ -349,13 +394,12 @@ export default function ImageEditor({
             draggable={false}
           />
           
-          {showOverlays && boxes.map((box, index) => {
-            // Calculate scale factors for rendering
+          {showOverlays && (() => {
             const rect = imageRef.current?.getBoundingClientRect()
             const scaleX = rect ? rect.width / (imageRef.current!.naturalWidth || 1) : 1
             const scaleY = rect ? rect.height / (imageRef.current!.naturalHeight || 1) : 1
             
-            return (
+            return boxes.map((box, index) => (
               <div
                 key={`${box.id}`}
                 className={`text-overlay ${selectedBoxIndex === index ? 'selected' : ''}`}
@@ -402,8 +446,8 @@ export default function ImageEditor({
                   </>
                 )}
               </div>
-            );
-          })}
+            ))
+          })()}
         </div>
       </div>
 
@@ -425,6 +469,48 @@ export default function ImageEditor({
           background: #f8f9fa;
           border-bottom: 1px solid #ddd;
           flex-wrap: wrap;
+        }
+        
+        .editor-properties {
+          padding: 0.75rem 1rem;
+          border-bottom: 1px solid #e1e1e1;
+          background: #ffffff;
+          display: flex;
+          flex-direction: column;
+          gap: 0.75rem;
+        }
+        
+        .properties-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 1rem;
+        }
+        
+        .properties-group {
+          display: flex;
+          flex-direction: column;
+          gap: 0.25rem;
+          min-width: 200px;
+          flex: 1;
+        }
+        
+        .properties-label {
+          font-size: 0.8rem;
+          color: #666;
+        }
+        
+        .properties-textarea {
+          min-height: 60px;
+          padding: 0.5rem;
+          border-radius: 4px;
+          border: 1px solid #ccc;
+          font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          font-size: 0.85rem;
+          resize: vertical;
+        }
+        
+        .properties-slider {
+          width: 100%;
         }
         
         .toolbar-group {

@@ -2,9 +2,9 @@
   "name": "document-translator-web",
   "version": "0.1.0",
   "private": true,
-  "//": "NOTE: react-window v1.8.10 is used because newer versions (2.x) have different exports. React types pinned for compatibility.",
+  "//": "Use pnpm install (not npm). react-window 1.8.10 for compatibility.",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
@@ -15,6 +15,7 @@
     "react": "^18",
     "react-dom": "^18",
     "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.0",
     "react-window": "1.8.10"
   },
   "devDependencies": {

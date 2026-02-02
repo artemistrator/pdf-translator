@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import MarkdownPreview from '../components/MarkdownPreview'
 
 export default function TestLlmPage() {
@@ -16,6 +16,13 @@ export default function TestLlmPage() {
   const [editingImage, setEditingImage] = useState<any>(null)
   const [textBlocks, setTextBlocks] = useState<any[]>([])
   const [selectedBlock, setSelectedBlock] = useState<any>(null)
+  const [draggingBlockId, setDraggingBlockId] = useState<number | null>(null)
+  const [dragOffset, setDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 })
+  const [resizingBlockId, setResizingBlockId] = useState<number | null>(null)
+  const [resizeHandle, setResizeHandle] = useState<'nw' | 'ne' | 'sw' | 'se' | null>(null)
+  const [savedBlocksByImage, setSavedBlocksByImage] = useState<Record<string, any[]>>({})
+
+  const editorContainerRef = useRef<HTMLDivElement | null>(null)
   
   // Simple image translation test states
   const [simpleImageFile, setSimpleImageFile] = useState<File | null>(null)
@@ -25,6 +32,10 @@ export default function TestLlmPage() {
   
   // API base URL
   const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000'
+
+  const activeBlock = selectedBlock
+    ? textBlocks.find((block) => block.id === selectedBlock.id) || selectedBlock
+    : null
   
   // Handle PDF upload
   async function handleUploadPdf(file: File) {
@@ -163,11 +174,17 @@ export default function TestLlmPage() {
         translationData
       })
       
-      // Initialize text blocks from translation data
-      let blocks = []
+      // Initialize text blocks from translation data or previously saved state
+      let blocks: any[] = []
       console.log('📊 [TRANSLATION ELEMENTS]', translationData.text_elements)
-      
-      if (translationData.text_elements && Array.isArray(translationData.text_elements)) {
+
+      const savedBlocks = savedBlocksByImage[imageName]
+
+      if (savedBlocks && savedBlocks.length > 0) {
+        // Re-use previously saved layout for this image
+        blocks = savedBlocks
+        console.log('♻️ [USING SAVED BLOCKS]', { imageName, count: blocks.length })
+      } else if (translationData.text_elements && Array.isArray(translationData.text_elements)) {
         blocks = translationData.text_elements.map((element: any, index: number) => ({
           id: index,
           x: Math.max(10, Math.min(element.x || 50, 500)),
@@ -178,7 +195,8 @@ export default function TestLlmPage() {
           fontSize: element.fontSize || (element.text?.length > 20 ? 14 : 16),
           fontWeight: element.fontWeight || 'normal',
           fontStyle: element.fontStyle || 'normal',
-          color: element.color || '#000000'
+          color: element.color || '#000000',
+          backgroundColor: element.backgroundColor || 'rgba(255, 255, 255, 0.9)',
         }))
       } else {
         // Fallback blocks if no translation data
@@ -193,7 +211,8 @@ export default function TestLlmPage() {
             fontSize: 16,
             fontWeight: 'normal',
             fontStyle: 'normal',
-            color: '#000000'
+            color: '#000000',
+            backgroundColor: 'rgba(255, 255, 255, 0.9)',
           }
         ]
       }
@@ -217,6 +236,57 @@ export default function TestLlmPage() {
       handleUploadPdf(e.target.files[0])
     }
   }
+
+  // Generate and download PDF that mirrors the current preview
+  const handleDownloadPdf = async () => {
+    if (!jobId || !markdown) return
+    
+    try {
+      setStatus('Generating PDF from Markdown...')
+      setError(null)
+
+      // Переписываем markdown так, чтобы все картинки смотрели
+      // на актуальные (переведённые/отредактированные) файлы,
+      // как в превью.
+      const imageRegex = /!\[[^\]]*\]\(([^)]+)\)/g
+      const markdownForPdf = markdown.replace(imageRegex, (full, path) => {
+        const rawPath = String(path)
+        const noQuery = rawPath.split('?')[0]
+        const originalName = noQuery.split('/').pop() || ''
+
+        const mappedUrl = translatedImages[originalName]
+        if (!mappedUrl) return full
+
+        const mappedNoQuery = mappedUrl.split('?')[0]
+        const mappedName = mappedNoQuery.split('/').pop() || originalName
+
+        const newPath = rawPath.replace(originalName, mappedName)
+        return full.replace(path, newPath)
+      })
+
+      const response = await fetch(`${API_BASE_URL}/api/pdf-from-markdown/${jobId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ markdown: markdownForPdf }),
+      })
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}))
+        throw new Error(data.detail?.error || data.detail || 'PDF generation failed')
+      }
+
+      setStatus('PDF generated. Opening preview...')
+
+      // Open the generated PDF in a new tab (served by /api/result)
+      const pdfUrl = `${API_BASE_URL}/api/result/${jobId}?mode=pdf-from-markdown`
+      if (typeof window !== 'undefined') {
+        window.open(pdfUrl, '_blank', 'noopener,noreferrer')
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'PDF generation failed'
+      setError(`PDF error: ${message}`)
+    }
+  }
   
   // Handle block updates
   const updateBlock = (id: number, updates: Partial<any>) => {
@@ -224,28 +294,148 @@ export default function TestLlmPage() {
       block.id === id ? { ...block, ...updates } : block
     ))
   }
-  
-  // Handle drag events for text blocks
-  const handleDragStart = (e: React.DragEvent<HTMLDivElement>, blockId: number) => {
-    e.dataTransfer.setData('blockId', blockId.toString())
+
+  const deleteBlock = (id: number) => {
+    setTextBlocks(prev => prev.filter(block => block.id !== id))
+    if (selectedBlock?.id === id) {
+      setSelectedBlock(null)
+    }
   }
-  
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault()
+
+  const handleBlockMouseDown = (e: React.MouseEvent<HTMLDivElement>, block: any) => {
+    if (!editorContainerRef.current) return
+
+    // Если клик пришёлся по элементу, помеченному как "no-drag" (кнопка удаления и т.п.),
+    // не запускаем перетаскивание
+    const target = e.target as HTMLElement
+    if (target.closest('[data-no-drag="true"]')) {
+      return
+    }
+
+    e.stopPropagation()
+    const rect = editorContainerRef.current.getBoundingClientRect()
+    const mouseX = e.clientX - rect.left
+    const mouseY = e.clientY - rect.top
+
+    setDraggingBlockId(block.id)
+    setDragOffset({
+      x: mouseX - block.x,
+      y: mouseY - block.y,
+    })
+    setSelectedBlock(block)
   }
-  
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>, containerRect: DOMRect) => {
-    e.preventDefault()
-    const blockId = parseInt(e.dataTransfer.getData('blockId'))
-    const rect = containerRect
-    
-    // Calculate relative coordinates
-    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width - 50))
-    const y = Math.max(0, Math.min(e.clientY - rect.top, rect.height - 30))
-    
-    console.log('📍 [DROP COORDS]', { x, y, clientX: e.clientX, clientY: e.clientY, rectLeft: rect.left, rectTop: rect.top })
-    updateBlock(blockId, { x, y })
+
+  const handleResizeMouseDown = (
+    e: React.MouseEvent<HTMLDivElement>,
+    block: any,
+    handle: 'nw' | 'ne' | 'sw' | 'se'
+  ) => {
+    e.stopPropagation()
+    setResizingBlockId(block.id)
+    setResizeHandle(handle)
+    setSelectedBlock(block)
   }
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!editorContainerRef.current) return
+      const rect = editorContainerRef.current.getBoundingClientRect()
+      const mouseX = e.clientX - rect.left
+      const mouseY = e.clientY - rect.top
+
+      if (draggingBlockId !== null) {
+        setTextBlocks(prev =>
+          prev.map(block => {
+            if (block.id !== draggingBlockId) return block
+            const newX = mouseX - dragOffset.x
+            const newY = mouseY - dragOffset.y
+            const clampedX = Math.max(0, Math.min(newX, rect.width - block.width))
+            const clampedY = Math.max(0, Math.min(newY, rect.height - block.height))
+            return { ...block, x: clampedX, y: clampedY }
+          })
+        )
+      }
+
+      if (resizingBlockId !== null && resizeHandle) {
+        setTextBlocks(prev =>
+          prev.map(block => {
+            if (block.id !== resizingBlockId) return block
+
+            let { x, y, width, height } = block
+            const minWidth = 50
+            const minHeight = 30
+
+            const maxRight = rect.width
+            const maxBottom = rect.height
+
+            const right = x + width
+            const bottom = y + height
+
+            switch (resizeHandle) {
+              case 'se': {
+                const newRight = Math.min(mouseX, maxRight)
+                const newBottom = Math.min(mouseY, maxBottom)
+                width = Math.max(minWidth, newRight - x)
+                height = Math.max(minHeight, newBottom - y)
+                break
+              }
+              case 'sw': {
+                const newLeft = Math.max(0, mouseX)
+                const newBottom = Math.min(mouseY, maxBottom)
+                width = Math.max(minWidth, right - newLeft)
+                height = Math.max(minHeight, newBottom - y)
+                x = Math.min(newLeft, right - minWidth)
+                break
+              }
+              case 'ne': {
+                const newRight = Math.min(mouseX, maxRight)
+                const newTop = Math.max(0, mouseY)
+                width = Math.max(minWidth, newRight - x)
+                height = Math.max(minHeight, bottom - newTop)
+                y = Math.min(newTop, bottom - minHeight)
+                break
+              }
+              case 'nw': {
+                const newLeft = Math.max(0, mouseX)
+                const newTop = Math.max(0, mouseY)
+                width = Math.max(minWidth, right - newLeft)
+                height = Math.max(minHeight, bottom - newTop)
+                x = Math.min(newLeft, right - minWidth)
+                y = Math.min(newTop, bottom - minHeight)
+                break
+              }
+            }
+
+            return {
+              ...block,
+              x,
+              y,
+              width,
+              height,
+            }
+          })
+        )
+      }
+    }
+
+    const handleMouseUp = () => {
+      if (draggingBlockId !== null || resizingBlockId !== null) {
+        setDraggingBlockId(null)
+        setResizingBlockId(null)
+        setResizeHandle(null)
+      }
+    }
+
+    if (draggingBlockId !== null || resizingBlockId !== null) {
+      document.addEventListener('mousemove', handleMouseMove)
+      document.addEventListener('mouseup', handleMouseUp)
+    }
+
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove)
+      document.removeEventListener('mouseup', handleMouseUp)
+    }
+  }, [draggingBlockId, resizingBlockId, dragOffset, resizeHandle])
   
   // Save final image
   const saveEditedImage = async () => {
@@ -253,13 +443,29 @@ export default function TestLlmPage() {
     
     try {
       setStatus('Saving edited image...')
-      
+
+      // Нормализуем координаты блоков относительно контейнера редактора,
+      // чтобы backend мог корректно отрисовать их на исходном изображении.
+      let payloadBlocks = textBlocks
+      if (editorContainerRef.current) {
+        const rect = editorContainerRef.current.getBoundingClientRect()
+        const w = rect.width || 1
+        const h = rect.height || 1
+        payloadBlocks = textBlocks.map(block => ({
+          ...block,
+          normX: block.x / w,
+          normY: block.y / h,
+          normWidth: block.width / w,
+          normHeight: block.height / h,
+        }))
+      }
+
       const response = await fetch(`${API_BASE_URL}/api/save-edited-image/${jobId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           imageName: editingImage.name,
-          textBlocks
+          textBlocks: payloadBlocks,
         })
       })
       
@@ -277,6 +483,13 @@ export default function TestLlmPage() {
         console.log('🔄 [IMAGES STATE UPDATED]', updated)
         return updated
       })
+
+      // Сохраняем актуальное состояние блоков для этого изображения,
+      // чтобы при повторном открытии редактора сохранить layout / цвет / шрифт.
+      setSavedBlocksByImage(prev => ({
+        ...prev,
+        [editingImage.name]: textBlocks,
+      }))
       
       // Close editor
       setEditingImage(null)
@@ -340,28 +553,46 @@ export default function TestLlmPage() {
               color: '#666'
             }}>
               <span>Job ID: {jobId}</span>
-              <button
-                onClick={() => {
-                  setJobId(null)
-                  setMarkdown('')
-                  setTranslatedImages({})
-                  setTranslatings({})
-                  setStatus('')
-                  setError(null)
-                }}
-                style={{
-                  padding: '0.5rem 1rem',
-                  background: '#dc3545',
-                  color: 'white',
-                  border: 'none',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  fontSize: '0.85rem',
-                  fontWeight: '500'
-                }}
-              >
-                New Document
-              </button>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <button
+                  onClick={handleDownloadPdf}
+                  disabled={!markdown}
+                  style={{
+                    padding: '0.5rem 1rem',
+                    background: markdown ? '#007bff' : '#6c757d',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: markdown ? 'pointer' : 'not-allowed',
+                    fontSize: '0.85rem',
+                    fontWeight: '500'
+                  }}
+                >
+                  Скачать PDF
+                </button>
+                <button
+                  onClick={() => {
+                    setJobId(null)
+                    setMarkdown('')
+                    setTranslatedImages({})
+                    setTranslatings({})
+                    setStatus('')
+                    setError(null)
+                  }}
+                  style={{
+                    padding: '0.5rem 1rem',
+                    background: '#dc3545',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '0.85rem',
+                    fontWeight: '500'
+                  }}
+                >
+                  New Document
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -500,19 +731,7 @@ export default function TestLlmPage() {
                 // Image Editor View
                 <div style={{ position: 'relative', width: '100%', height: '100%' }}>
                   <div 
-                    ref={(el) => {
-                      if (el) {
-                        const handleContainerDrop = (e: React.DragEvent<HTMLDivElement>) => {
-                          handleDrop(e, el.getBoundingClientRect())
-                        }
-                        el.addEventListener('dragover', handleDragOver as any)
-                        el.addEventListener('drop', handleContainerDrop as any)
-                        return () => {
-                          el.removeEventListener('dragover', handleDragOver as any)
-                          el.removeEventListener('drop', handleContainerDrop as any)
-                        }
-                      }
-                    }}
+                    ref={editorContainerRef}
                     style={{ 
                       position: 'relative', 
                       width: '100%', 
@@ -527,25 +746,56 @@ export default function TestLlmPage() {
                     {textBlocks.map(block => (
                       <div
                         key={block.id}
-                        draggable
-                        onDragStart={(e) => handleDragStart(e, block.id)}
+                        onMouseDown={(e) => handleBlockMouseDown(e, block)}
                         style={{
                           position: 'absolute',
                           left: `${block.x}px`,
                           top: `${block.y}px`,
                           width: `${block.width}px`,
                           height: `${block.height}px`,
-                          border: selectedBlock?.id === block.id ? '2px solid #007bff' : '1px dashed #999',
-                          backgroundColor: 'rgba(255, 255, 255, 0.9)',
-                          cursor: 'move',
+                          border: activeBlock?.id === block.id ? '2px solid #007bff' : '1px dashed #999',
+                          backgroundColor: block.backgroundColor || 'rgba(255, 255, 255, 0.9)',
+                          cursor: draggingBlockId === block.id ? 'grabbing' : 'move',
                           display: 'flex',
                           alignItems: 'center',
                           padding: '4px',
                           userSelect: 'none',
-                          boxShadow: '0 2px 4px rgba(0,0,0,0.1)'
+                          boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                          boxSizing: 'border-box'
                         }}
-                        onClick={() => setSelectedBlock(block)}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          setSelectedBlock(block)
+                        }}
                       >
+                        <button
+                          data-no-drag="true"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            deleteBlock(block.id)
+                          }}
+                          style={{
+                            position: 'absolute',
+                            top: '-12px',
+                            right: '-16px',
+                            width: '20px',
+                            height: '20px',
+                            borderRadius: '50%',
+                            border: 'none',
+                            backgroundColor: '#dc3545',
+                            color: '#fff',
+                            fontSize: '12px',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            boxShadow: '0 1px 3px rgba(0,0,0,0.3)'
+                          }}
+                          title="Удалить блок"
+                        >
+                          ×
+                        </button>
+
                         <input
                           type="text"
                           value={block.text}
@@ -563,12 +813,73 @@ export default function TestLlmPage() {
                             fontFamily: 'inherit'
                           }}
                         />
+
+                        {activeBlock?.id === block.id && (
+                          <>
+                            <div
+                              onMouseDown={(e) => handleResizeMouseDown(e, block, 'nw')}
+                              style={{
+                                position: 'absolute',
+                                width: '10px',
+                                height: '10px',
+                                left: '-5px',
+                                top: '-5px',
+                                borderRadius: '50%',
+                                backgroundColor: '#007bff',
+                                border: '2px solid #fff',
+                                cursor: 'nw-resize',
+                              }}
+                            />
+                            <div
+                              onMouseDown={(e) => handleResizeMouseDown(e, block, 'ne')}
+                              style={{
+                                position: 'absolute',
+                                width: '10px',
+                                height: '10px',
+                                right: '-5px',
+                                top: '-5px',
+                                borderRadius: '50%',
+                                backgroundColor: '#007bff',
+                                border: '2px solid #fff',
+                                cursor: 'ne-resize',
+                              }}
+                            />
+                            <div
+                              onMouseDown={(e) => handleResizeMouseDown(e, block, 'sw')}
+                              style={{
+                                position: 'absolute',
+                                width: '10px',
+                                height: '10px',
+                                left: '-5px',
+                                bottom: '-5px',
+                                borderRadius: '50%',
+                                backgroundColor: '#007bff',
+                                border: '2px solid #fff',
+                                cursor: 'sw-resize',
+                              }}
+                            />
+                            <div
+                              onMouseDown={(e) => handleResizeMouseDown(e, block, 'se')}
+                              style={{
+                                position: 'absolute',
+                                width: '10px',
+                                height: '10px',
+                                right: '-5px',
+                                bottom: '-5px',
+                                borderRadius: '50%',
+                                backgroundColor: '#007bff',
+                                border: '2px solid #fff',
+                                cursor: 'se-resize',
+                              }}
+                            />
+                          </>
+                        )}
                       </div>
                     ))}
                   </div>
                   
                   {/* Editor Controls */}
-                  {selectedBlock && (
+                  {activeBlock && (
                     <div style={{ 
                       marginTop: '1rem', 
                       padding: '1rem', 
@@ -583,11 +894,11 @@ export default function TestLlmPage() {
                             type="range"
                             min="8"
                             max="72"
-                            value={selectedBlock.fontSize}
-                            onChange={(e) => updateBlock(selectedBlock.id, { fontSize: parseInt(e.target.value) })}
+                            value={activeBlock.fontSize}
+                            onChange={(e) => updateBlock(activeBlock.id, { fontSize: parseInt(e.target.value) })}
                             style={{ width: '100%' }}
                           />
-                          <span>{selectedBlock.fontSize}px</span>
+                          <span>{activeBlock.fontSize}px</span>
                         </div>
                         <div>
                           <label>Width:</label>
@@ -595,19 +906,19 @@ export default function TestLlmPage() {
                             type="range"
                             min="50"
                             max="500"
-                            value={selectedBlock.width}
-                            onChange={(e) => updateBlock(selectedBlock.id, { width: parseInt(e.target.value) })}
+                            value={activeBlock.width}
+                            onChange={(e) => updateBlock(activeBlock.id, { width: parseInt(e.target.value) })}
                             style={{ width: '100%' }}
                           />
-                          <span>{selectedBlock.width}px</span>
+                          <span>{activeBlock.width}px</span>
                         </div>
                       </div>
-                      <div style={{ marginTop: '1rem', display: 'flex', gap: '1rem' }}>
+                      <div style={{ marginTop: '1rem', display: 'flex', gap: '1rem', alignItems: 'center' }}>
                         <button
-                          onClick={() => updateBlock(selectedBlock.id, { fontWeight: selectedBlock.fontWeight === 'bold' ? 'normal' : 'bold' })}
+                          onClick={() => updateBlock(activeBlock.id, { fontWeight: activeBlock.fontWeight === 'bold' ? 'normal' : 'bold' })}
                           style={{ 
                             padding: '0.5rem 1rem',
-                            backgroundColor: selectedBlock.fontWeight === 'bold' ? '#007bff' : '#f8f9fa',
+                            backgroundColor: activeBlock.fontWeight === 'bold' ? '#007bff' : '#f8f9fa',
                             border: '1px solid #ddd',
                             borderRadius: '4px'
                           }}
@@ -615,16 +926,24 @@ export default function TestLlmPage() {
                           Bold
                         </button>
                         <button
-                          onClick={() => updateBlock(selectedBlock.id, { fontStyle: selectedBlock.fontStyle === 'italic' ? 'normal' : 'italic' })}
+                          onClick={() => updateBlock(activeBlock.id, { fontStyle: activeBlock.fontStyle === 'italic' ? 'normal' : 'italic' })}
                           style={{ 
                             padding: '0.5rem 1rem',
-                            backgroundColor: selectedBlock.fontStyle === 'italic' ? '#007bff' : '#f8f9fa',
+                            backgroundColor: activeBlock.fontStyle === 'italic' ? '#007bff' : '#f8f9fa',
                             border: '1px solid #ddd',
                             borderRadius: '4px'
                           }}
                         >
                           Italic
                         </button>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <label>Block color:</label>
+                          <input
+                            type="color"
+                            value={activeBlock.backgroundColor || '#ffffff'}
+                            onChange={(e) => updateBlock(activeBlock.id, { backgroundColor: e.target.value })}
+                          />
+                        </div>
                         <button
                           onClick={saveEditedImage}
                           style={{ 
@@ -660,7 +979,7 @@ export default function TestLlmPage() {
                     borderRadius: '4px',
                     textAlign: 'center'
                   }}>
-                    <p>👆 Click 'Translate to Russian' buttons on images above to open the editor</p>
+                    <p>👆 Click &apos;Translate to Russian&apos; buttons on images above to open the editor</p>
                   </div>
                 </div>
               ) : (

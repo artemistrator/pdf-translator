@@ -325,8 +325,8 @@ async def generate_pdf_from_markdown(markdown_path: Path, output_pdf: Path, vari
 </div>'''
                 markdown_with_overlays = re.sub(pattern, replacement, markdown_with_overlays)
     
-    # 7) Convert markdown with overlays to HTML
-    html_content = markdown2.markdown(markdown_with_overlays)
+    # 7) Convert markdown with overlays to HTML (extras=['tables'] for GFM tables)
+    html_content = markdown2.markdown(markdown_with_overlays, extras=['tables'])
     
     # 8) Apply variant-specific HTML modifications
     if variant == 2:

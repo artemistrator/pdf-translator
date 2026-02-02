@@ -1616,6 +1616,8 @@ async def save_edited_image(job_id: str, payload: dict):
         # Load original image
         from PIL import Image, ImageDraw, ImageFont
         with Image.open(original_path) as img:
+            img_width, img_height = img.size
+
             if img.mode != 'RGBA':
                 img = img.convert('RGBA')
             
@@ -1648,17 +1650,75 @@ async def save_edited_image(job_id: str, payload: dict):
                 except:
                     font = ImageFont.load_default()
                 
-                # Draw text with background for better visibility
-                x = block.get("x", 50)
-                y = block.get("y", 50)
+                # Resolve coordinates: prefer нормализованные, если они есть
+                norm_x = block.get("normX")
+                norm_y = block.get("normY")
+                norm_w = block.get("normWidth")
+                norm_h = block.get("normHeight")
+
+                if isinstance(norm_x, (int, float)) and isinstance(norm_y, (int, float)) \
+                   and isinstance(norm_w, (int, float)) and isinstance(norm_h, (int, float)) \
+                   and 0 <= norm_x <= 1 and 0 <= norm_y <= 1 and norm_w > 0 and norm_h > 0:
+                    x = int(norm_x * img_width)
+                    y = int(norm_y * img_height)
+                    width = int(norm_w * img_width)
+                    height = int(norm_h * img_height)
+                else:
+                    # Fallback: используем пиксельные координаты как есть
+                    x = int(block.get("x", 50))
+                    y = int(block.get("y", 50))
+                    width = int(block.get("width", 200))
+                    height = int(block.get("height", 40))
+
                 text = block.get("text", "")
-                color = tuple(int(block.get("color", "#000000").lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-                
-                # Add semi-transparent background for better readability
+                text_color_hex = block.get("color", "#000000")
+
+                # Parse text color (#rrggbb)
+                try:
+                    text_color = tuple(int(text_color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+                except Exception:
+                    text_color = (0, 0, 0)
+
+                # Parse background color from редактора
+                bg_raw = block.get("backgroundColor")
+                bg_color = (255, 255, 255, 230)  # default white with alpha
+
+                if isinstance(bg_raw, str):
+                    if bg_raw.startswith("#") and len(bg_raw) in (4, 7):
+                        try:
+                            hex_val = bg_raw.lstrip('#')
+                            if len(hex_val) == 3:
+                                hex_val = ''.join([c * 2 for c in hex_val])
+                            r = int(hex_val[0:2], 16)
+                            g = int(hex_val[2:4], 16)
+                            b = int(hex_val[4:6], 16)
+                            bg_color = (r, g, b, 230)
+                        except Exception:
+                            pass
+                    elif bg_raw.startswith("rgba"):
+                        try:
+                            # rgba(r,g,b,a)
+                            inside = bg_raw[5:-1]
+                            parts = [p.strip() for p in inside.split(",")]
+                            if len(parts) >= 3:
+                                r = int(float(parts[0]))
+                                g = int(float(parts[1]))
+                                b = int(float(parts[2]))
+                                a = int(float(parts[3]) * 255) if len(parts) > 3 else 230
+                                bg_color = (r, g, b, a)
+                        except Exception:
+                            pass
+
+                # Draw блок-фон и текст
                 if text.strip():
-                    bbox = draw.textbbox((x, y), text, font=font)
-                    draw.rectangle([bbox[0]-2, bbox[1]-2, bbox[2]+2, bbox[3]+2], fill=(255, 255, 255, 180))
-                    draw.text((x, y), text, fill=color, font=font)
+                    padding = 4
+                    # Фон блока как прямоугольник
+                    draw.rectangle(
+                        [x, y, x + width, y + height],
+                        fill=bg_color
+                    )
+                    # Текст внутри блока с небольшим отступом
+                    draw.text((x + padding, y + padding), text, fill=text_color, font=font)
             
             # Save final image
             img.save(final_path, 'PNG')
@@ -1857,8 +1917,8 @@ async def download_html_with_ocr(job_id: str, filename: str = None):
         import os
         import re
         
-        # Convert markdown to HTML
-        html_content = markdown2.markdown(markdown_content)
+        # Convert markdown to HTML (extras=['tables'] for GFM tables)
+        html_content = markdown2.markdown(markdown_content, extras=['tables'])
         
         # Get API base URL for asset paths
         api_base = os.getenv("API_BASE_URL", "http://localhost:8000")

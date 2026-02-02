@@ -1473,7 +1473,7 @@ export default function Home() {
                     <MarkdownPreview
                       markdown={markdownPreview}
                       jobId={jobId}
-                      onTranslateImage={handleTranslateImage}
+                      onTranslateImage={(imageName) => handleTranslateImage(imageName, 'russian')}
                       apiBaseUrl={API_BASE_URL}
                       translatedImages={translatedImages}
                       translatingImages={translatingImages}

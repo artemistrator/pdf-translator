@@ -2,6 +2,8 @@
 
 import React, { useMemo, useCallback, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import styles from './MarkdownPreview.module.css'
 
 interface ImageTranslationState {
   translating: boolean
@@ -112,10 +114,10 @@ const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({
       )
     },
 
-    // Table renderer with proper styling
+    // Table renderer with proper styling (GFM tables via remark-gfm)
     table: ({ node, ...props }: any) => (
-      <div className="table-wrapper">
-        <table {...props} className="markdown-table" />
+      <div className={styles['table-wrapper']}>
+        <table {...props} className={styles['markdown-table']} />
       </div>
     ),
 
@@ -132,8 +134,8 @@ const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({
 
   if (!memoizedMarkdown) {
     return (
-      <div className="markdown-preview empty">
-        <div className="empty-state">
+      <div className={`${styles['markdown-preview']} ${styles.empty}`}>
+        <div className={styles['empty-state']}>
           <svg 
             width="64" 
             height="64" 
@@ -160,8 +162,9 @@ const MarkdownPreview: React.FC<MarkdownPreviewProps> = ({
   }
 
   return (
-    <div className="markdown-preview">
+    <div className={styles['markdown-preview']}>
       <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
         components={components}
         skipHtml={false}
       >
