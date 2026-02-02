@@ -78,6 +78,14 @@ Web app will be available at: http://localhost:3000
 | `make lint` | Run linters on all code |
 | `make format` | Format all code |
 
+## 🖼️ Features Showcase
+
+### Markdown Support (including tables)
+![Markdown Support](https://github.com/artemistrator/pdf-translator/blob/main/%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA%20%D1%8D%D0%BA%D1%80%D0%B0%D0%BD%D0%B0%202026-02-02%20%D0%B2%2014.34.11.png)
+
+### Image Editor
+![Image Editor](https://github.com/artemistrator/pdf-translator/blob/main/%D0%A1%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA%20%D1%8D%D0%BA%D1%80%D0%B0%D0%BD%D0%B0%202026-02-02%20%D0%B2%2014.32.26.png)
+
 ## 🔧 API Endpoints
 
 ### Upload a PDF file:
