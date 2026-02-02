@@ -1,44 +1,53 @@
 # Document Translator (Vision-LLM) MVP
 
-Minimal working skeleton for Document Translator MVP.
+Advanced document translation platform using computer vision and LLMs for accurate document reconstruction with preserved formatting.
 
-## Project Structure
+## ✨ Features
+
+- **PDF Translation**: Upload PDF documents and translate text while preserving original layout
+- **OCR Integration**: Advanced Optical Character Recognition for text extraction from images
+- **Visual Text Editor**: Interactive editor to adjust translated text positioning
+- **Image Translation**: Translation of embedded images with text overlays
+- **Markdown Conversion**: Convert PDFs to editable Markdown with embedded images
+- **PDF Regeneration**: Reconstruct PDFs from translated content with original formatting
+
+## 🏗️ Project Structure
 
 ```
 .
 ├── /apps/
-│   ├── /api/          # FastAPI backend (Python 3.11)
-│   └── /web/          # Next.js frontend (TypeScript)
+│   ├── /api/          # FastAPI backend (Python 3.11) with Vision APIs
+│   └── /web/          # Next.js frontend (TypeScript) with visual editor
 ├── /infra/            # Docker Compose and dev scripts
-├── /docs/             # Documentation
+├── /docs/             # Technical documentation
 ├── /data/             # Storage directory (gitignored)
 ├── .env.example
 ├── Makefile
 └── README.md
 ```
 
-## Prerequisites
+## 🚀 Quick Start
+
+### 1. Prerequisites
 
 - Python 3.11
 - Node.js 18+
 - Docker & Docker Compose
 - pnpm (preferred) or npm
 
-## Quick Start
-
-### 1. Install dependencies
+### 2. Install dependencies
 
 ```bash
 make install
 ```
 
-### 2. Start Redis
+### 3. Start Redis
 
 ```bash
 make redis-up
 ```
 
-### 3. Start Backend (API)
+### 4. Start Backend (API)
 
 In terminal 1:
 ```bash
@@ -47,7 +56,7 @@ make api-dev
 
 API will be available at: http://localhost:8000
 
-### 4. Start Frontend (Web)
+### 5. Start Frontend (Web)
 
 In terminal 2:
 ```bash
@@ -56,7 +65,7 @@ make web-dev
 
 Web app will be available at: http://localhost:3000
 
-## Development Commands
+## 🛠️ Development Commands
 
 | Command | Description |
 |---------|-------------|
@@ -69,17 +78,7 @@ Web app will be available at: http://localhost:3000
 | `make lint` | Run linters on all code |
 | `make format` | Format all code |
 
-## Ports
-
-- **API**: http://localhost:8000
-- **Web**: http://localhost:3000
-- **Redis**: localhost:6379
-
-## Health Check
-
-Visit http://localhost:3000 and click "Check API" button to test the connection to the backend.
-
-## Testing the Upload API
+## 🔧 API Endpoints
 
 ### Upload a PDF file:
 ```bash
@@ -95,6 +94,19 @@ Expected response:
 }
 ```
 
+### Process PDF with Vision API:
+```bash
+curl -X POST http://localhost:8000/api/process/550e8400-e29b-41d4-a716-446655440000
+```
+
+Expected response:
+```json
+{
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "done"
+}
+```
+
 ### Check job status:
 ```bash
 curl http://localhost:8000/api/status/550e8400-e29b-41d4-a716-446655440000
@@ -104,38 +116,55 @@ Expected response:
 ```json
 {
   "job_id": "550e8400-e29b-41d4-a716-446655440000",
-  "status": "queued",
+  "status": "completed",
   "message": ""
 }
 ```
 
-### Check job result (placeholder):
+### Convert to Markdown:
 ```bash
-curl http://localhost:8000/api/result/550e8400-e29b-41d4-a716-446655440000
+curl -X POST http://localhost:8000/api/pdf-markdown/550e8400-e29b-41d4-a716-446655440000
 ```
 
-Expected response (while job is queued):
-```json
-{
-  "detail": "Job is not completed yet. Current status: queued"
-}
+### Get Markdown content:
+```bash
+curl http://localhost:8000/api/pdf-markdown/550e8400-e29b-41d4-a716-446655440000
 ```
 
-## File Storage Location
-
-Uploaded files are stored in:
-```
-./data/jobs/{job_id}/input.pdf
-./data/jobs/{job_id}/job.json
-```
-
-Example:
-```
-./data/jobs/550e8400-e29b-41d4-a716-446655440000/input.pdf
-./data/jobs/550e8400-e29b-41d4-a716-446655440000/job.json
+### Generate PDF from Markdown:
+```bash
+curl -X POST http://localhost:8000/api/pdf-from-markdown/550e800-e29b-41d4-a716-446655440000 \
+  -H "Content-Type: application/json" \
+  -d '{"markdown": "# Hello World\n\nTranslated content here..."}'
 ```
 
-## Environment Variables
+### OCR on images:
+```bash
+curl -X POST http://localhost:8000/api/ocr/550e8400-e29b-41d4-a716-446655440000/page1_img1.png
+```
+
+## 🖼️ Visual OCR Editor
+
+The application includes a visual editor for fine-tuning text positioning:
+
+1. **Upload PDF** - Start the translation process
+2. **Process Document** - Extract images and text with Vision API
+3. **Edit Content** - Modify text content and positioning in the visual editor
+4. **Generate Output** - Create final translated PDF
+
+## 📁 File Storage Location
+
+Uploaded files and job data are stored in:
+```
+./data/jobs/{job_id}/
+├── input.pdf
+├── job.json
+├── vision.json
+├── render.html
+└── output.pdf
+```
+
+## ⚙️ Environment Variables
 
 Copy `.env.example` to `.env` and configure:
 
@@ -148,3 +177,22 @@ Variables:
 - `STORAGE_DIR` - Directory for file storage
 - `REDIS_URL` - Redis connection URL
 - `API_BASE_URL` - Backend API base URL for frontend
+
+## 🧪 Testing
+
+Run the complete workflow test:
+```bash
+python apps/api/test_complete_ocr_workflow.py
+```
+
+## 🌐 Ports
+
+- **API**: http://localhost:8000
+- **Web**: http://localhost:3000
+- **Redis**: localhost:6379
+
+## 📋 Supported Formats
+
+- **Input**: PDF documents
+- **Output**: PDF, Markdown
+- **Image Processing**: PNG, JPG, JPEG, GIF, SVG
