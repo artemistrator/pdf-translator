@@ -60,6 +60,11 @@ apps/api/.venv/
 ehthumbs.db
 Thumbs.db
 
+# Screenshots
+Снимок экрана*.png
+Screenshot*.png
+Screen Shot*.png
+
 # Local configuration
 .env
 .env.local
