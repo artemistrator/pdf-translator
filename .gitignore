@@ -35,11 +35,14 @@ coverage.xml
 # Virtual environments
 env/
 venv/
+.venv/
 ENV/
 env.bak
 venv.bak
-.venv
-.ENV
+.ENV/
+
+# Python virtual environment
+apps/api/.venv/
 
 # IDE
 .idea/
@@ -68,6 +71,7 @@ Thumbs.db
 
 # Node.js (for the web app)
 node_modules/
+pnpm-store/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -76,6 +80,11 @@ out/
 .nuxt/
 dist/
 build/
+
+# Large binary files
+*.node
+*.dylib
+*.so
 
 # Data and temporary files
 data/
